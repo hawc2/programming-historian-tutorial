@@ -1,0 +1,783 @@
+---
+title: "FULL PIPE!! Programming Historian on YouTube Comments in Wordfish"
+author: "Jeff Antsen, Nicole Lemire Garlic, Alex Wermer-Colan"
+date: "6/13/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# 0: SETUP
+### Set code block default prefs
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(eval=TRUE)
+#knitr::opts_root.dir$.... #@ there is syntax for correctly setting a directory alternate to the base one here.
+#@ I don't think we even need to worry about that, though.
+
+```
+
+### Install Packages
+```{r install_packages, eval=FALSE}
+# Install Packages and Library Calls
+#install.packages("knitr")
+#install.packages("NLP")
+#install.packages("tm")
+#install.packages("tidyverse")
+#install.packages("ggplot2")
+#install.packages("austin", repos="http://R-Forge.R-project.org")
+#install.packages("beepr")
+#install.packages("RColorBrewer")
+#install.packages("tuber")
+#install.packages("gtools")
+#install.packages("data.table")
+#install.packages("lubridate")
+```
+
+### Call Libraries
+```{r call_libraries, echo=FALSE, results='hide'}
+# CLEANUP your workspace (before running / rerunning code)
+##       __   
+rm(list=ls())
+
+# Call Libraries
+#library(kintr)
+library(NLP)
+library(tm)
+library(tidyverse)
+library(ggplot2)
+library(austin)
+library(beepr)
+library(RColorBrewer)
+library(tuber)
+library(gtools)
+library(data.table)
+library(lubridate)
+```
+
+### Authorize your API account
+Remember to push 1 for 'yes; in the CONSOLE! And then log into your gmail/google account.
+```{r authorize, echo=TRUE, results='hide'}
+#Saving the client ID and client secret for subsequent use by the tuber package
+#the first time you authorize your credentials, at prompt choose "1: Yes IN THE CONSOLE!"
+#this creates your personal .httr-oauth file - you only need to do this once, as long as you don't delete that file!
+
+source("Config.R") # This contains all the othe user-given config info, plus has a space to enter credentails too.
+#source("~/Desktop/tuber_credential_holder.R")   # Make this file on your desktop to hold your credentials.
+# Then we don't have to worry during pipeline development about an accidentail credential push to GitHub!
+
+app_id <- API_ID
+app_secret <- API_Secret
+
+
+yt_oauth(app_id, app_secret)    #@ do we need to update or specify permissions for our oauth key?
+```
+
+
+### Read In Parameters / Tolerances from the Config file
+~~ Can add additional parameters to the Config file
+```{r Parameters_and_Tolerances_From_Config, echo=FALSE, results='hide'}
+### NOTE - we do NOT need to re-assign any of these values from the config file(s)
+### However, for the purpose of clarity, I don't think it's necessarily the wrong call to do so.
+
+# Read in Subject / Terms from Config.R
+subject_s <- Subject
+SearchTerms <- Search
+
+# Read in search dates from Config.R
+BeforeSearchDate <- BeforeDate
+AfterSearchDate <- AfterDate
+
+# Read in data refinement options from Config.R
+OnlyTopVideos      <- top_N_videos[1]  # T/F - do this or not?
+NumbVideos         <- top_N_videos[2]  # if so, what value?
+
+KeepMinComments    <- atleast_M_comments[1] # T/F - do this or not?
+MinComments        <- atleast_M_comments[2] # if so, what value?
+
+
+### Should we add comment-level parameters?
+### Thought we don't want to encourage folks to mess with these unless they know what they are doing...  could be (e.g.)
+# How many characters do you want your comments to be at minimum, initially?
+# How many tokens (minimum) do you want your final comments to have post-stopwords and sparsity?
+
+### Any other relevant up-front parameters?
+
+```
+
+
+# 1: SCRAPING DATA - 'code' begins here
+### Get list of videos matching your search terms
+and organize that video list
+```{r get_video_list}
+SearchResults <- map(SearchTerms, yt_search)
+SearchResultsDF <- do.call(rbind, lapply(SearchResults, data.frame))
+SearchResultsDF[] <- lapply(SearchResultsDF, as.character)
+SearchResultsDF$publishedAt <- SearchResultsDF$publishedAt %>% as_datetime(tz = "UTC", format = NULL)
+SearchResultsDF <- select(SearchResultsDF, video_id, publishedAt, title, channelTitle) %>% arrange(desc(publishedAt))
+
+SearchResultsDF <- SearchResultsDF %>% filter(publishedAt > AfterSearchDate & publishedAt < BeforeSearchDate)
+video_list <-as.vector(SearchResultsDF$video_id) #final list of video IDs
+
+length(video_list)
+```
+IF YOU ARE USING YOUR OWN VIDEO LIST, skip to the end of this chunk and create your own vector of video ID strings
+
+### Scrape available comments on each of those videos
+This chunk gets all available video comments from API, and converts to a dataframe. It uses `r possibly()` to avoid error messages for unavailable videos comments.
+
+```{r scrape_available_comments, warning=FALSE}
+# video_list <-c("MAKE", "YOUR", "OWN")
+get_avlbl_comments <- possibly(get_all_comments, otherwise = NULL)
+AllComments <- map(video_list, get_avlbl_comments)
+AllCommentsDF <- do.call(smartbind, lapply(AllComments, data.frame))  # this works but returns a BUNCH of warnings
+#View(AllComments[[3]])
+#View(AllCommentsDF)
+
+#nrow(AllCommentsDF)
+#if(any(duplicated(AllCommentsDF$id))==T){
+#  print(paste("You have", length(which(duplicated(AllCommentsDF$id)==TRUE)) ,"duplicate comments! Removing them now."))
+#  AllCommentsDF <- AllCommentsDF %>% distinct(id, .keep_all = TRUE)
+#}
+nrow(AllCommentsDF)
+
+AllCommentsVideos <- unique(AllCommentsDF$videoId)  #stores which video comments were scraped
+beep("coin")
+```
+
+
+```{r how_many_videos}
+print(paste("You have identified", nrow(AllCommentsDF), "comments from", length(AllCommentsVideos), "unique videos identified using the", length(SearchTerms) ,"tags: ", paste(SearchTerms, collapse=", "),"."))
+```
+
+
+### Merge Metadata (includes video titles) from Search Results
+```{r join_metadata}
+#joins video metadata to comments and renames columns for clarity
+
+AllCommentsMetadata <- inner_join(AllCommentsDF, SearchResultsDF, by = c("videoId" = "video_id"))
+AllCommentsMetadata <- rename(AllCommentsMetadata, c(commentPublishedAt = publishedAt.x,
+                                                     commentUpdatedAt = updatedAt,
+                                                     commentLikeCount = likeCount,
+                                                     commentId = id,
+                                                     videoPublishedAt= publishedAt.y,
+                                                     videoTitle = title,
+                                                     videoChannelTitle = channelTitle))
+#View(AllCommentsMetadata)
+```
+
+# 2: SAVE and READ DATA
+### Recommended -- Save Your Data
+```{r output_comments, eval=FALSE, echo=FALSE}
+# Save your data
+write.csv(AllCommentsMetadata, paste("Data/AllComments__", subject_s,"_", today("EST"),".csv", sep=""))
+```
+
+### And, read data back in here (only if you need to!)
+```{r read_in_data, warnings=FALSE}
+#yourdata <- read.csv(paste("Data/AllComments_", subject_s, "_", today("EST"), ".csv", sep="")) # Import data you saved today!
+
+#yourdata <- read.csv("Data/AllComments_Last Week Tonight_2020-06-12.csv") # small LWT single video dataset
+#yourdata <- read.csv("Data/AllComments_floyd.csv")            # - medium BLM dataset
+#yourdata <- read.csv("Data/AllCommentsMetadata 5 29 20.csv")  # - big COVID / stay at home dataset
+#View(yourdata)  #@ if not using data scraped with this tool, you may need to do reformatting (changing col names, etc)
+
+#nrow(yourdata)
+#AllCommentsMetadata <- yourdata
+```
+
+# 3: DATA CLEANING
+#### limit comments by top videos, and/or by minimum # comments per video
+Do you want to limit to N videos ~and/or~ to at least M comments per video?
+```{r select_comments_basedOn_parameters}
+totalScraped <- AllCommentsMetadata %>% group_by(videoTitle) %>% tally() %>% arrange(desc(n))
+
+
+nrow(AllCommentsMetadata)
+
+#Two options:
+#1. remove videos with less than M comments and view final count
+if(KeepMinComments == TRUE){
+tooFew <- filter(totalScraped, n < MinComments)
+AllCommentsMetadata <- AllCommentsMetadata %>% anti_join(tooFew)
+AllCommentsMetadata %>% group_by(videoTitle) %>% tally() %>% arrange(desc(n))  # how many comments, from which video, remain?
+}
+nrow(AllCommentsMetadata)
+
+#AND/OR
+#2. keep N videos with highest number of comments
+if(OnlyTopVideos == TRUE){
+Discards <- totalScraped[-(1:NumbVideos), ]
+AllCommentsMetadata <- AllCommentsMetadata %>% anti_join(Discards)
+AllCommentsMetadata %>% group_by(videoTitle) %>% tally() %>% arrange(desc(n)) # # how many comments, from which video, remain?
+}
+nrow(AllCommentsMetadata)
+```
+
+
+###tokenize those longer comments
+This creates list of tokenized comment vectors, used to make the corpus object below
+```{r tokenize_elaborate_comments, echo=FALSE, results='hide'}
+
+comment_tokens_l <- list()
+
+for (com in 1:nrow(AllCommentsMetadata)) {
+  sto <- AllCommentsMetadata$textOriginal[com]
+        #@ preprocess each comment, keep
+  stolist <- list()
+  sto <- tolower(sto)
+  sto_list <- strsplit(sto, "\\W")
+  sto_text <- unlist(sto_list)
+  sto_rm <- sto_text[-which(sto_text == "")]; sto_text <- sto_rm
+  if(length (sto_text) >= 8 & length(unique(sto_text)) >=5) {   #@ comments with at least 8 words, 5 of which are unique
+        #@ create list.head               
+    list.head <- paste(AllCommentsMetadata$videoTitle[com], "%_%", com,"%_%", AllCommentsMetadata$commentId[com], "%_%", AllCommentsMetadata$videoChannelTitle[com], sep="")
+    comment_tokens_l[[list.head]] <- sto_text
+  }}
+beep("coin")
+comment_ids <- names(comment_tokens_l)
+length(comment_tokens_l)
+```
+
+```{r how_many_comments_1}
+print(paste("keeping",length(comment_tokens_l), "out of", nrow(AllCommentsMetadata),"comments ;",round((length(comment_tokens_l)/nrow(AllCommentsMetadata))*100, 2), "% of total comments kept" ))
+```
+
+### Making the Corpus
+```{r data_reshape_for_WF, echo=FALSE, warning=FALSE, results='hide'}
+####### Turn the list of comment files into a corpus data object
+####### this kind of analyiss can only be executed on a corpus object
+
+comment_corpus <- Corpus(VectorSource(comment_tokens_l))   #@ this function needs a list of tokenized char vectors
+comment_corpus <- tm_map(comment_corpus, removeNumbers)
+comment_corpus <- tm_map(comment_corpus, removePunctuation)
+
+for(com in 1:length(comment_corpus)){   
+          # remove the leading "c"s added when the corpus command concatonates tokens (maybe we can avoid this?)
+  if(substr(comment_corpus[[com]]$content,1,1)=="c"){
+    comment_corpus[[com]]$content<- substr(comment_corpus[[com]]$content, 2, nchar(comment_corpus[[com]]$content))}}
+
+my_stop <- c(stopwords("english"),
+             "c","x", "s", "t", "m", "amp", "youtube", "www", "com", "quot", "br", "http", "https", "")
+
+comment_corpus <- tm_map(comment_corpus, removeWords, my_stop)
+beep("coin")
+
+#!!!The DocumentTermMatrix
+dtm = DocumentTermMatrix(comment_corpus)
+dtm   # old DTM has 56,732 terms, new has 52,297 - removed 4435 terms caused due to leading "c"s
+
+#View(dtm$dimnames$Terms)
+
+```
+
+### Control Sparseness, pre remvoing bad comments
+```{r DTM_sparsity_control, echo=TRUE, results='hide'}
+########################################
+########## Set accepted sparsity parameter
+########################################
+sparsity <- .9977
+dtma = removeSparseTerms(dtm, sparse = sparsity)
+#@ including too many very sparse (infrequent) terms negatively impacts results
+dtma
+#dtma has 2779 terms, 54485 comments pre workup loop
+
+```
+
+### Identify Problem Comments, and remove them
+```{r which_com_have_0_words_left?}
+### I need to wrap this in a 'while' loop!!!
+problem_comments <- NA
+
+while(length(problem_comments) > 0 ) {  # WHILE any problem comments (may) remain - always do this once
+
+dtma_matrix <- as.matrix(dtma)
+
+problem_comments <- NA
+for(com in 1:nrow(dtma_matrix) ){                 # Identify problem comments
+  if(sum(dtma_matrix[com,]) < 11 ){
+    #print(comment_corpus[[com]]["content"])
+    problem_comments <- c(problem_comments, com)
+  }}
+#print(problem_comments)
+problem_comments <- problem_comments[(-1)];       # Delete the leading NA - then, if no problem comments, this will be length 0
+
+if(length(problem_comments) > 0 ){                # Remove the problem comments and their corresponding titles
+  print(paste("removing", length(problem_comments), "problem comments"))
+  comment_corpus <- comment_corpus[(-problem_comments)]  
+  comment_ids <- comment_ids[(-problem_comments)]
+} else {
+    print("There don't appear to be any [more] comments with too few words")
+  }
+
+dtm1 <-DocumentTermMatrix(comment_corpus)  # make new DTM
+
+dtma <- removeSparseTerms(dtm1, sparse=sparsity) # and remove sparse terms again
+rm(dtma_matrix)  #@ remove the ponderous dtma_matrix object
+}
+length(comment_ids)
+```
+
+```{r how_many_comments_2}
+print(paste("Modeling",length(dtma$dimnames$Terms),"words from", length(dtma$dimnames$Docs), "comments with a usable number of tokens, of the original", nrow(AllCommentsMetadata), "comments.",round((length(dtma$dimnames$Docs))/nrow(AllCommentsMetadata)*100, 2) , "% of total comments kept from initial scrape... now trying to WF!"))
+
+
+```
+
+# 4: FISHIN for Words!
+```{r WORDFISH}
+########################################
+####### Running a wordfish model
+########################################
+possibly_fish <- possibly(wordfish, otherwise=NULL)
+wfa1 <- possibly_fish(as.wfm(dtma), dir=c(1, 2), control = list(tol = 3.0e-5), verbose = T)
+#wfa1 <- wordfish(as.wfm(dtma), dir=c(1, 2), control = list(tol = 3.0e-5), verbose = T)
+
+wfa1$docs <- comment_ids #@ This is the actual names (ids) of all of the good comments!
+str(wfa1)
+# beeps are useful to signify when long processes have completed
+beep("coin")
+```
+
+
+### Store data from WF model as independant objects (helpful for later manipulation)
+```{r store_WF_model_data, echo=FALSE}
+wfdocs_v <- wfa1$docs
+theta <- wfa1$theta
+alpha <- wfa1$alpha
+
+wfwords_v <- wfa1$words
+beta <- wfa1$beta
+psi <- wfa1$psi
+```
+
+### View some properties of the WF model (not necessary)
+```{r view_WF_model_properties, echo=TRUE}
+sum(theta[which(theta>0)])
+sum(theta[which(theta<0)])
+mean(theta)
+sum(theta)
+
+### View a histogram of the distribution of each key variable
+hist(theta, breaks=30)  # document polarity (refined iteratively)
+hist(alpha, breaks=30)  # fixed effect for document length
+hist(beta, breaks=50)   # word polarity (refined iteratively)
+hist(psi, breaks=50)    # fixed effect for term (aka ~type~) frequency
+
+```
+
+### Make Composite Data Objects
+For simpler indexing, and also objects that can hold more metadata than the WF model initially captures
+```{r make_WF_data_objects, echo=FALSE, results='hide'}
+
+comment_identifiers<-data.frame(NA, NA, NA, NA, NA, NA)
+colnames(comment_identifiers) <- c("short_title","short_channel","video_title", "comment_number", "comment_id", "video_channel")
+
+
+for (com in 1:length(wfdocs_v)){
+split <- unlist(strsplit(wfdocs_v[com], "%_%"))
+comment_identifiers[com,3:6] <- split
+title <- unlist(strsplit(comment_identifiers$video_title[com], " "))
+channel <- unlist(strsplit(comment_identifiers$video_channel[com], " "))
+#                      s_title <- paste(title[1:4], collapse=" ")
+s_title <- title[1]               # make the 'short title' - first 5 words with 3+ chars
+for(t_word in 2:length(title)){
+  if(nchar(title[t_word]) > 2) {
+    s_title <- c(s_title, title[t_word])
+  }}
+  if(length(s_title > 4)) {
+  s_title <- s_title[1:5]}
+s_title <- paste(s_title, collapse=" ")
+comment_identifiers$short_title[com] <- s_title  
+
+#s_channel <- channel[1]               # make the 'short channel' - first 5 words with 3+ chars
+#for(c_word in 1:length(channel)){
+#  if(nchar(channel[c_word]) > 2) {
+#    s_channel <- c(s_channel, channel[c_word])
+#  }}
+#  if(length(s_channel > 4)) {
+#  s_channel <- s_channel[1:5]}
+#s_channel <- paste(s_channel, collapse=" ")
+#comment_identifiers$short_channel[com] <- s_channel
+}
+
+### CREATE DOC DATA DATAFRAME
+wf_docdata.df <- data.frame(theta, alpha, comment_identifiers, wfdocs_v)
+#View(wf_docdata.df)
+
+### CREATE WORD DATA DATAFRAME
+wf_worddata.df <- data.frame(wfwords_v, beta, psi)
+#View(wf_worddata.df)
+
+#weird_words <- wf_worddata.df$wfwords_v[which((wf_worddata.df$psi < -7))]  # views extremely rare words that were kept
+#weird_words
+
+#weird_comments <- wf_docdata.df$comment_number[which((wf_docdata.df$alpha < -3))]# views weird comments that were kept
+#weird_comments
+#View(AllCommentsMetadata[as.numeric(weird_comments),])
+
+```
+
+# 5: VISUALIZATIONS
+### Comment (doc) polarity, color by video 'short title'
+This is particularly useful / meaningful if you are modeling comments from ~6 or less videos.
+```{r comments_by_shorttitle, echo=FALSE}
+
+#@ if you want to re-save visualizations with different parameters, you can change subject_s to be more specific of params
+#original_subject <- subject_s
+#subject_s <- paste(subject_s, "_updated N word min comments")
+#SearchTerms <- c("reopening america", "reopen america", "#reopenamerica", "freeamericanow", "#freeamericanow")
+
+short_title_T_A_plot <- ggplot(data = wf_docdata.df,
+                                   mapping = aes(x =theta, y = alpha, label = comment_number, color=short_title))+
+  geom_text(size = .8) +
+  labs(x = "Comment polarity: an optimized value (theta)", y = "Comment length: a fixed effect (alpha)") +
+  guides(size = "none", color = guide_legend("")) + theme(legend.position="bottom") +
+  theme(legend.text = element_text(size=4)) +
+  labs(title = paste("Polarity of ", subject_s, "comments on YouTube, colorized by Video"),
+                      subtitle= paste("identified using the tags:", paste(SearchTerms, collapse=" ")))
+short_title_T_A_plot
+
+ggsave(paste("Visualizations/",subject_s, "__shorttitle_T_A_plot_", today("EST"),".pdf",sep=""), device="pdf")
+```
+
+### Comment (doc) polarity, color by video
+```{r another_comment_plot2, eval=F, echo=F}
+channel_T_A_plot <- ggplot(data = wf_docdata.df, mapping = aes(x =theta, y = alpha, label = comment_number, color=video_channel))+ geom_text(size = .8) +
+  labs(x = "Comment polarity: an optimized value (theta)", y = "Comment length: a fixed effect (alpha)") +
+  guides(size = "none", color = guide_legend("")) + theme(legend.position="bottom") +
+  theme(legend.text = element_text(size=4)) +
+  labs(title = paste("Polarity of ", subject_s, "comments on YouTube, colorized by Video Channel"),
+                      subtitle= paste("identified using the tags:", paste(SearchTerms, collapse=" ")))
+channel_T_A_plot
+
+ggsave(paste("Visualizations/",subject_s, "__channel_T_A_plot_", today("EST"),".pdf",sep=""), device="pdf")
+```
+
+
+### Comment words (tokens) polarity scatter
+```{r word_scatterfish}
+word_P_B_plot <- ggplot(data = wf_worddata.df, mapping = aes(x = beta, y = psi, label = wfwords_v)) +
+  geom_text(data=subset(wf_worddata.df, psi>-8), size = 0.755) +
+  labs(x = "Word polarity: an optimized value (beta)", y = "Word frequency: a fixed effect (psi)") +
+  #guides(size = "none", color = guide_legend("")) +
+  labs(title = paste("Polarity of typical words used in", subject_s, "YouTube comments"),
+                   subtitle= paste("identified using the tags:", paste(SearchTerms, collapse=" ")))
+word_P_B_plot
+
+ggsave(paste("Visualizations/", subject_s, "__Word_P_B_plot_", today("EST"), ".pdf",sep=""), device="pdf")
+
+```
+
+
+
+
+### Final Beeps for All Done!
+```{r final_beeps}
+beep("coin");beep("coin")
+beep("complete")
+beep("mario")
+```
+
+###### Color by SOURCE  (this does not currently work)
+#source_T_A_plot <- ggplot(data = wf_docdata.df, mapping = aes(x =theta, y = alpha, label = title, color=source))+
+#  geom_text(size = .7) +
+#  labs(x = "Doc polarity: an optimized value (theta)", y = "Doc length: a fixed effect (alpha)") +
+#  guides(size = "none", color = guide_legend("")) + theme(legend.position="bottom") +
+#  labs(title = paste (subject_s,
+#                      " comments from ABC YouTube Videos:\n Article IDs plotted, shaded by comment thread source", #sep=""))
+##     __
+#source_T_A_plot
+#ggsave(paste(subject_s, "SUBSET_source_T_A_plot.pdf",sep=""), device="pdf")
+
+
+
+###### COLORLESS
+source_T_A_plot <- ggplot(data = wf_docdata.df, mapping = aes(x =theta, y = alpha, label = title)) +
+  geom_text(size = 1) +
+  labs(x = "Doc polarity: an optimized value (theta)", y = "Doc length: a fixed effect (alpha)") +
+  #guides(size = "none", color = guide_legend("")) + theme(legend.position="bottom") +
+  labs(title = paste (subject_s,
+                      " comments from ABC YouTube Videos:\n Article IDs plotted, shaded by comment thread source", sep=""))
+##     __
+source_T_A_plot
+
+#ggsave(paste(subject_s, "SUBSET_colorless_T_A_plot.pdf",sep=""), device="pdf")
+
+
+
+ggsave(paste(subject_s, "Word_P_B_plot.pdf",sep=""), device="pdf")
+
+
+### Colorizing Key Words
+```{r give_keywords_color, echo=FALSE, eval=FALSE}
+######################## SO optimized!!
+#wf_worddata.df_unreduced <- wf_worddata.df
+## RESET wf_worddata.df if/when needed     __ wf_worddata.df <- data.frame(word, beta, psi)
+
+######+++++++++++++++++++++++++++++++++++++++++++ Set which KEY TERMS should have BIG FONT
+
+neutral <- "neutral"  # Grey
+topA <- "Of Interest"      # Red
+topB <- "Wall"      #
+topC <- "Money"      #
+topD <- "Trade"      #
+topE <- "Rape"     #
+topF <- "Voting"   #
+topG <- "Drugs"    #
+topH <- "Jobs"     #
+#topic_colors <- c()
+
+wf_worddata.df$key <- neutral  ### SET / RESET default font SIZE/COLOR and word coding
+
+
+ktA <- c("trump", "animal", "animals", "obama", "illegal", "mexico", "mexican", "caravan",
+         "jew", "jews", "jewish", "security", "secure", "national", "nation")
+for(k in 1:length(ktA)){
+  sto <- NA
+  sto <- (which(word==ktA[k]))
+  #print(sto)
+  wf_worddata.df$key[sto] <-topA }   ### NEW FONT SIZE
+#View(wf_worddata.df[which(wf_worddata.df$key==topA),])
+
+
+ktB <- c("wall", "build", "steel", "concrete", "border", "dig", "tunnels", "bars", "invisible", "see")
+for(k in 1:length(ktB)){
+  sto <- NA
+  sto <- (which(word==ktB[k]))
+  wf_worddata.df$key[sto] <-topB }    ### NEW FONT SIZE
+#View(wf_worddata.df[which(wf_worddata.df$key==topB),])
+
+ktC <- c("money", "tax", "taxes", "taxpayers", "billion", "billions", "spend", "spent", "pay", "billionz")
+for(k in 1:length(ktC)){
+  sto <- NA
+  sto <- (which(word==ktC[k]))
+  wf_worddata.df$key[sto] <-topC }    ### NEW FONT SIZE
+#View(wf_worddata.df[which(wf_worddata.df$key==topC),])
+
+ktD <- c("nafta", "trade", "usmca")
+for(k in 1:length(ktD)){
+  sto <- NA
+  sto <- (which(word==ktD[k]))
+  wf_worddata.df$key[sto] <-topD }    ### NEW FONT SIZE
+#View(wf_worddata.df[which(wf_worddata.df$key==topD),])
+
+
+ktE <- c("rape", "raped", "raping", "rapes", "assault", "sexual", "victim", "rapists", "ptsd")
+for(k in 1:length(ktE)){
+  sto <- NA
+  sto <- (which(word==ktE[k]))
+  wf_worddata.df$key[sto] <-topE }    ### NEW FONT SIZE
+#View(wf_worddata.df[which(wf_worddata.df$key==topE),])
+
+ktF <- c("vote", "voting", "election", "elections", "electoral", "rights", "birthrights")
+for(k in 1:length(ktF)){
+  sto <- NA
+  sto <- (which(word==ktF[k]))
+  wf_worddata.df$key[sto] <-topF }    ### NEW FONT SIZE
+#View(wf_worddata.df[which(wf_worddata.df$key==topF),])
+
+ktG <- c("drug", "drugs", "illicit", "police", "marijuana", "heroin", "coke", "cocaine", "fentanyl")
+for(k in 1:length(ktG)){
+  sto <- NA
+  sto <- (which(word==ktG[k]))
+  wf_worddata.df$key[sto] <-topG }    ### NEW FONT SIZE
+#View(wf_worddata.df[which(wf_worddata.df$key==topG),])
+
+
+ktH <- c("job", "jobs", "economic", "work", "worker", "labor", "laborer", "farm", "farms", "agriculture")
+for(k in 1:length(ktH)){
+  sto <- NA
+  sto <- (which(word==ktH[k]))
+  wf_worddata.df$key[sto] <-topH }    ### NEW FONT SIZE
+#View(wf_worddata.df[which(wf_worddata.df$key==topH),])
+
+```
+
+### Final Colorized-by-words plot
+```{r word_color_vis, echo=FALSE, eval=FALSE, warning=FALSE}
+
+#+++++++++++++++  use this step to snip off extreem beta and psi vales to maximize plotting area
+
+#lowpsi <- which(wf_worddata.df$psi <= (-9.9))
+#lowbeta <- which(wf_worddata.df$beta <= (-4.4))
+#wf_worddata.df <- wf_worddata.df[(-lowpsi), ]
+#wf_worddata.df <- wf_worddata.df[(-lowbeta), ]
+
+#which(wf_worddata.df$psi <= (-13))    ## check your work!
+
+wordLegend_P_B_plot <- ggplot(data = wf_worddata.df, mapping = aes(x = beta, y = psi, label = word, color=key)) +
+  ylim(-11,.2)+ xlim(-5,6) +       #tight limits
+  #ylim(-14,.2)+ xlim(-7,8) +     #more expanded limits
+  geom_text(data=subset(wf_worddata.df, key== neutral), size = .85, color="gray") +
+  geom_text(data=subset(wf_worddata.df, key!= neutral), size = 2.2) +
+  scale_color_discrete(l=40) +
+  #scale_color_manual(values=c("#00008B", "#8B2323", "#006400", "goldenrod4", "#8B0A50" )) +
+  guides(size = "none", color = guide_legend("")) + theme(legend.position = "top") +
+  labs(x = "Word polarity: an optimized value (beta)", y = "Word frequency: a fixed effect (psi)") +
+  labs(title = "Vocabulary Polarity in comment network cliques of one thread scraped from YouTube",
+       subtitle="'CNN reporter presses Trump: You promised Mexico would pay for wall'\n key terms bolded")
+
+######           __
+wordLegend_P_B_plot
+
+#ggsave(paste(subject_s, "_QQQQ_SUBSET_wordLegend_P_B_plot.pdf",sep=""), device="pdf")
+
+
+
+```
+
+
+
+
+# R MARKDOWN tutorial
+# & HELPFUL MARKDWON SYNTAX REFERENCE SECTION
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+### this is NOT for the final version - just leaving it in until we have the syntax down pat
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+`r 2+3`  
+`2+3`
+
+$A = pi*r^2$  
+$$V = 1/3(pi*r^3)$$
+
+```{r echo=F, eval=F}
+# you NEED {r}!
+## moar code
+moar <- "moar code here"
+print(moar)
+vec <- c(1,2,3,4,5)
+str.vec <- c("a", "b", "c")
+```
+
+```{r, echo=F, eval=F}
+#doesn't work without {r}
+#moar code
+moarr <- "moar code again"
+print(moarr)
+```
+
+### examples
+
+`r moarr`  
+```{r, collapse=FALSE, echo=F, eval=F}
+print("this is a string")
+```
+`vec`  
+`r c(vec, str.vec)`  
+`r mean(c(1,2,3,4,5))`
+
+text1  
+text2  
+text3
+text3.5
+
+
+
+
+# DON'T NEED THE FOLLOWNG CHUNKS, PROBABLY
+Though in the case of issues with WF, word clouds wouldn't be the worst
+
+
+### ...Extra code here - word clouds and wordscore trials
+```{r extra_code, echo=F, eval=F}
+#
+#
+#
+############### Trying out Wordclouds....?
+############### Trying out Wordclouds....?
+############### Trying out Wordclouds....?
+
+#@ WC separate articles by
+
+
+###### Wordcloud!
+cloud.dtm <- TermDocumentMatrix(news.corpus)
+cloud.m <- as.matrix(cloud.dtm)
+cloud.v <- sort(rowSums(cloud.m),decreasing=TRUE)
+cloud.df <- data.frame(word = names(cloud.v),freq=cloud.v, stringsAsFactors = F)
+cloud.df <- cloud.df[-1,]
+View(head(cloud.df, 10))
+
+### remove " " and , from words
+clean.cloud.df <- cloud.df
+cloud.df[5,]
+word<-NA
+for (i in 1:nrow(cloud.df)){
+  sto<-NA
+  #sto <- gsub("\\W", "", cloud.df[i,1])  # this approach isn't working
+  sto <- cloud.df[i,1]
+  sto <- substr(sto,2,(nchar(sto)-2))
+  clean.cloud.df[i,1] <- sto
+}
+View(head(clean.cloud.df, 10))
+
+
+
+set.seed(1234)
+wordcloud(words = clean.cloud.df$word, freq = clean.cloud.df$freq, min.freq = 1,
+          max.words=99, random.order=FALSE, rot.per=0.35,
+          colors=brewer.pal(8, "Dark2"))
+
+
+findAssocs(cloud.dtm, terms = "dadt", corlimit = 0.3)  ## doesn't work, presumably b/c of quotes and '/', ',' issues
+
+cloud.dtm
+head(cloud.m)
+
+############### Trying out Wordclouds....?
+############### Trying out Wordclouds....?
+############### Trying out Wordclouds....?
+#
+#
+#
+#
+#
+
+
+
+############### Trying out Wordscores++++++++++++++++++++++++++++++ SKIP WORDSCORE BIT FOR NOW!
+############### Trying out Wordscores
+############### Trying out Wordscores
+############### Trying out Wordscores
+
+
+
+#install.packages("quanteda")
+require(quanteda)
+#install.packages("quanteda.corpora")
+#require(quanteda.corpora)
+
+files.v[c(4,47)]
+ref <- c(1,47) # reference texts
+vir <- 1:length(files.v) # SPS 2011 (short) is empty, thus not included
+vir <- vir[-ref] # everything minus the reference texts
+ref; vir
+
+#?getdocs()
+#?wfm()
+str(corpus)
+news.as.corpus<- corpus(news.corpus)
+str(news.as.corpus)
+r <- getdocs(news.as.corpus, ref)
+
+
+#?classic.wordscores()
+ws <- classic.wordscores(r, scores=c(0,1.4))
+
+
+
+################
+############### Trying out Wordscores
+############### Trying out Wordscores
+############### Trying out Wordscores
+############### Trying out Wordscores+++++++++++++++++++++++++++++++++++++++++ END WORDSCORE
+#
+#
+
+```
